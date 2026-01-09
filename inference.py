@@ -1,5 +1,6 @@
 import argparse
 import pandas as pd
+import numpy as np
 from models import *
 from preprocess import extract_sequence_features
 from torch.utils.data import DataLoader
@@ -31,9 +32,13 @@ if __name__ == "__main__":
 
     #tokenizer
     model_type = args.model_type
-    if model_type in ["GenomicCNN", "GenomicAttentionCNN", "CNNTransformer"]:
+    if model_type in ["GenomicCNN", "GenomicAttentionCNN", "CNNTransformer", "GenomicAttentionCNN2"]:
         #CNN implementation
         model = MODEL_REGISTRY[args.model_type](num_outputs=18)
+        
+        if model_type == "GenomicAttentionCNN2":
+            bio_features_list = [extract_sequence_features(row['sequence']) for _, row in test_seq.iterrows()]
+            bio_features = torch.tensor(np.array(bio_features_list), dtype=torch.float32).to(device)
 
         dataloader = DataLoader(
             test_seq["sequence"].tolist(),
@@ -46,13 +51,19 @@ if __name__ == "__main__":
         #transformer implementations
         tokenizer = AutoTokenizer.from_pretrained("InstaDeepAI/nucleotide-transformer-2.5b-multi-species")
         vocab_size = tokenizer.vocab_size
-        model = MODEL_REGISTRY[args.model_type](num_classes=18, vocab_size=vocab_size)
+        model = MODEL_REGISTRY[args.model_type](num_outputs=18, vocab_size=vocab_size)
         if model_type == "GenomicTransformer2":
-            bio_features = torch.tensor([extract_sequence_features(row['sequence']) for _, row in test_seq.iterrows()], dtype=torch.float32).to(device)
+            bio_features_list = [extract_sequence_features(row['sequence']) for _, row in test_seq.iterrows()]
+            bio_features = torch.tensor(np.array(bio_features_list), dtype=torch.float32).to(device)
         
-        input_ids = torch.stack(
-            test_seq["sequence"].apply(lambda x: tokenizer(x, return_tensors="pt")["input_ids"].squeeze(0)).tolist()
-        ).to(device)
+        tokenized = test_seq["sequence"].apply(lambda x: tokenizer(x, return_tensors="pt")["input_ids"].squeeze(0))
+        input_ids = torch.stack(tokenized.tolist()).to(device)
+
+        dataloader = DataLoader(
+            range(len(input_ids)),
+            batch_size=32,
+            shuffle=False
+        )
 
     model.load_state_dict(torch.load(weights_path, map_location=device))
     model.to(device)
@@ -61,16 +72,33 @@ if __name__ == "__main__":
     predictions = []
     with torch.no_grad():
         for batch_idx, batch in enumerate(dataloader):
-            batch = batch.to(device)
-            if args.model_type == "GenomicTransformer2":
-                outputs = model(input_ids, bio_features)
-            else:
-                outputs = model(batch)
+            if model_type in ["GenomicCNN", "GenomicAttentionCNN", "CNNTransformer", "GenomicAttentionCNN2"]:
+                # For CNN models, batch is already the collated sequence data
+                batch = batch.to(device)
                 
+                if model_type == "GenomicAttentionCNN2":
+                    # Get the corresponding bio features for this batch
+                    start_idx = batch_idx * 32
+                    end_idx = start_idx + batch.size(0)
+                    batch_bio_features = bio_features[start_idx:end_idx].to(device)
+                    outputs = model(batch, batch_bio_features)
+                else:
+                    outputs = model(batch)
+            else:
+                # For transformer models, batch contains indices
+                if isinstance(batch, torch.Tensor):
+                    batch = batch.tolist()
+                
+                batch_input_ids = input_ids[batch].to(device)
+                if model_type == "GenomicTransformer2":
+                    batch_bio_features = bio_features[batch].to(device)
+                    outputs = model(batch_input_ids, batch_bio_features)
+                else:
+                    outputs = model(batch_input_ids)
+
             preds = torch.argmax(outputs, dim=1).cpu()
             predictions.append(preds)
-
+    
     predictions = torch.cat(predictions).numpy() + 1
     output = pd.DataFrame(predictions.astype(int))
     output.to_csv(f'{args.output}/{args.model_type}_prediction.csv', index=False)
-
